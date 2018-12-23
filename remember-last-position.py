@@ -2,18 +2,41 @@
 Remember Last Position - Totem Plugin (see README.md)
 
 Created by Yauhen Lazurkin <foryauhen@gmail.com>
-Extended by Liran Funaro <funaro@cs.technion.ac.il>
-"""
-from configparser import ConfigParser
+Extended by Liran Funaro <fonaro@gmail.com>
 
-from gi.repository import GLib, GObject, Peas, Totem
+Copyright (C) 2006-2018 Liran Funaro
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+"""
+try:
+    # Python 3
+    from configparser import ConfigParser
+except:
+    # Python 2
+    from ConfigParser import ConfigParser
+
+
 import os
 import sys
-import time
 from ast import literal_eval
 from pprint import pprint
 from collections import OrderedDict
-from threading import Timer, Thread
+from threading import Timer
+
+from gi.repository import GLib, GObject, Peas, Totem
+
+from plugin_logger import plugin_logger
 
 
 def normalize_path(path):
@@ -35,8 +58,8 @@ def get_module_path():
     """
     module = sys.modules[__name__]
     module_file = normalize_path(module.__file__)
-    path, file = os.path.split(module_file)
-    name, ext = os.path.splitext(file)
+    path, file_name = os.path.split(module_file)
+    name, ext = os.path.splitext(file_name)
     return path, name
 
 
@@ -56,36 +79,46 @@ class RememberLastPositionPlugin(GObject.Object, Peas.Activatable):
         GObject.Object.__init__(self)
         self.data_folder, self.name = get_module_path()
         self.data_path = os.path.join(self.data_folder, "%s.pydata" % self.name)
-        self.read_config()
+        self.conf_path = os.path.join(self.data_folder, "%s.conf" % self.name)
 
         self.current_file = None
         self.current_time = 0
 
         self._totem = None
 
-    def read_config(self):
-        """ Read the config file """
-        cfg = ConfigParser(defaults=self.default_conf)
+        self.config = ConfigParser(defaults=self.default_conf)
+        self.load_on_start = None
+        self.load_on_start_delay = None
+        self.history_length = None
+        self.update_interval = None
+
+        self.update_time_timer = None
+        self.restore_last_file_timer = None
+
+        self.__data_queue__ = None
+
+    ###########################################################################
+    # Configuration
+    ###########################################################################
+
+    def load_config(self):
+        """ Load configuration from conf file """
         try:
-            conf_path = os.path.join(self.data_folder, "%s.conf" % self.name)
-            cfg.read(conf_path)
+            self.config.read(self.conf_path)
         except Exception as e:
-            print("Failed to read config file:", e)
+            plugin_logger.exception("Failed to read config file: %s", e)
 
-        def read_cfg(key, cfg_type=int):
-            try:
-                val = cfg.get('DEFAULT', key)
-                val = cfg_type(val)
-                if cfg_type == int:
-                    assert val > 0
-                return val
-            except:
-                return self.defaults_conf[key]
-
-        self.load_on_start = read_cfg('load-on-start', lambda x: x == 'true' or x == '1')
-        self.load_on_start_delay = read_cfg('load-on-start-delay')
-        self.history_length = read_cfg('history-length')
-        self.update_interval = read_cfg('update-interval')
+    def read_config_value(self, key, cfg_type=int):
+        """ Read specific value from the configuration """
+        try:
+            val = self.config.get('DEFAULT', key)
+            val = cfg_type(val)
+            if cfg_type == int:
+                assert val > 0
+            return val
+        except Exception as e:
+            plugin_logger.warning("Failed to read config value: %s", e)
+            return self.defaults_conf[key]
 
     ###########################################################################
     # Totem plugin methods
@@ -93,6 +126,12 @@ class RememberLastPositionPlugin(GObject.Object, Peas.Activatable):
 
     def do_activate(self):
         self._totem = self.object
+
+        self.load_config()
+        self.load_on_start = self.read_config_value('load-on-start', lambda x: x == 'true' or x == '1')
+        self.load_on_start_delay = self.read_config_value('load-on-start-delay')
+        self.history_length = self.read_config_value('history-length')
+        self.update_interval = self.read_config_value('update-interval')
 
         # Register handlers
         self._totem.connect('file-closed', self.on_file_closed)
@@ -111,17 +150,17 @@ class RememberLastPositionPlugin(GObject.Object, Peas.Activatable):
     # Handlers
     ###########################################################################
 
-    def on_file_opened(self, to, file_path):
+    def on_file_opened(self, _to, file_path):
         self.cancel_restore_last_file()
         self.stop_update_current_time()
         self.current_file = file_path
         self.current_time = self.last_time
 
-    def on_file_played(self, to, file_path):
+    def on_file_played(self, _to, _file_path):
         self.go_to_last_position()
         self.start_update_current_time()
 
-    def on_file_closed(self, to):
+    def on_file_closed(self, _to):
         self.stop_update_current_time()
         self.set_time(self.current_file, self.current_time)
         self.current_file = None
@@ -155,7 +194,7 @@ class RememberLastPositionPlugin(GObject.Object, Peas.Activatable):
         try:
             self.current_time = self._totem.get_property('current_time')
         except Exception as e:
-            print("Failed to read current time:", e)
+            plugin_logger.warning("Failed to read current time: %s", e)
 
     def start_update_current_time(self):
         """ Read the current seek position in intervals """
@@ -165,14 +204,17 @@ class RememberLastPositionPlugin(GObject.Object, Peas.Activatable):
 
     def stop_update_current_time(self):
         """ Stop the update seek position timer """
+        if self.update_time_timer is None:
+            return
+
         try:
             self.update_time_timer.cancel()
-        except:
-            pass
+        except Exception as e:
+            plugin_logger.warning("Failed to stop update: %s", e)
 
     def restore_last_file(self):
         """ Restore the last played file """
-        last_file = self.last_file
+        last_file = self.last_file()
         if not last_file:
             return
         self._totem.remote_command(Totem.RemoteCommand.REPLACE, last_file)
@@ -184,10 +226,13 @@ class RememberLastPositionPlugin(GObject.Object, Peas.Activatable):
 
     def cancel_restore_last_file(self):
         """ Cancel the timer for restore last file """
+        if self.restore_last_file_timer is None:
+            return
+
         try:
             self.restore_last_file_timer.cancel()
-        except:
-            pass
+        except Exception as e:
+            plugin_logger.warning("Failed to cancel restore: %s", e)
 
     ###########################################################################
     # Data Queue
@@ -196,22 +241,24 @@ class RememberLastPositionPlugin(GObject.Object, Peas.Activatable):
     @property
     def data_queue(self):
         """ Read the data queue property from a file """
-        if not hasattr(self, '__data_queue__'):
+        if self.__data_queue__ is None:
             try:
                 self.__data_queue__ = self.__read_data_queue()
             except Exception as e:
-                print("Failed to read data queue from file:", e)
+                plugin_logger.warning("Failed to read data queue from file: %s", e)
                 self.__data_queue__ = self.__default_data_queue()
 
         return self.__data_queue__
 
-    @property
     def last_file(self):
         """ Retrieve the last file that was played """
+        if not self.data_queue:
+            return None
         try:
             return next(reversed(self.data_queue))
-        except:
-            return ""
+        except Exception as e:
+            plugin_logger.warning("Failed to read last file from queue: %s", e)
+            return None
 
     @property
     def last_time(self):
@@ -240,7 +287,8 @@ class RememberLastPositionPlugin(GObject.Object, Peas.Activatable):
     # Data Queue Helpers
     ###########################################################################
 
-    def __default_data_queue(self, *args, **kwargs):
+    @staticmethod
+    def __default_data_queue(*args, **kwargs):
         return OrderedDict(*args, **kwargs)
 
     def __read_data_queue(self):
